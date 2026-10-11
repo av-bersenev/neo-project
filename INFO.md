@@ -1,2 +1,3 @@
-info file
+info file.
 experiment with amend
+new line
