@@ -1,159 +1,165 @@
+import time
 from datetime import datetime
 from pathlib import Path
-import re
+from bs4 import BeautifulSoup
 import pandas as pd
-import pdfplumber
 import requests
 
-PDF_URL = "https://www.avaclinic.ru/upload/iblock/341/19xnp4z9h1vh0i5bavskwa30od3ip4t9/Preyskurant-uslug-AVA_PETER-25.09.2026.pdf"
+BASE_URL = "https://www.avaclinic.ru/prices/"
 
-# Настройка путей относительно проекта
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-
-PDF_FILE = DATA_DIR / "preyskurant.pdf"
-EXCEL_FILE = DATA_DIR / f"ava_peter_parsed_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "*/*",
+}
 
 
-def download_pdf(url: str, output_path: Path):
-    """Скачивает PDF-файл потоком, чтобы не перегружать память."""
-    print(f"Скачиваем PDF по ссылке: {url}...")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    response = requests.get(url, headers=headers, stream=True, timeout=30)
-    response.raise_for_status()
+def get_all_directions(session: requests.Session) -> list[dict]:
+    """Сбор всех чекбоксов DIRECTION с их ID и названиями."""
+    print("Ищем все направления на странице цен...")
+    resp = session.get(BASE_URL, headers=HEADERS)
 
-    with open(output_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-    print(
-        f"PDF успешно сохранен: {output_path} ({round(output_path.stat().st_size / 1024 / 1024, 2)} МБ)"
-    )
+    if resp.status_code != 200:
+        print(f"Ошибка загрузки главной страницы: {resp.status_code}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    directions = []
+
+    # Находим все чекбоксы с name="DIRECTION"
+    inputs = soup.find_all("input", {"name": "DIRECTION"})
+
+    for inp in inputs:
+        d_id = inp.get("value")
+        name = inp.get("data-name")
+
+        if not name:
+            label = soup.find("label", {"id": d_id})
+            name = label.get_text(strip=True) if label else f"Направление_{d_id}"
+
+        if d_id and d_id.isdigit():
+            directions.append({"id": d_id, "name": name.strip()})
+
+    print(f"Найдено направлений: {len(directions)}")
+    return directions
 
 
-def extract_data_from_pdf(pdf_path: Path) -> list[dict]:
-    """Извлекает строки таблиц из всех страниц PDF."""
-    records = []
-    current_category = "Общий раздел"
+def parse_direction(
+    session: requests.Session, direction_id: str, direction_name: str
+) -> list[dict]:
+    """Парсит все страницы услуг конкретного направления."""
+    page = 1
+    direction_results = []
+    seen_services = set()
 
-    print("Начинаем обработку страниц PDF...")
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        print(f"Всего страниц в файле: {total_pages}")
+    while True:
+        if page == 1:
+            params = {"DIRECTION": direction_id}
+        else:
+            params = {
+                "DIRECTION": direction_id,
+                "SERVICE_NAV": f"page-{page}",
+                "ajax": "Y",
+                "APPEND": "Y",
+            }
 
-        for page_num, page in enumerate(pdf.pages, start=1):
-            # Извлекаем таблицу со страницы
-            table = page.extract_table()
+        try:
+            resp = session.get(BASE_URL, params=params, headers=HEADERS, timeout=15)
+        except Exception as e:
+            print(f"  Ошибка запроса на стр. {page}: {e}")
+            break
 
-            if not table:
-                # Если сетка не явная, пробуем метод без строгих линий
-                table = page.extract_table(
-                    table_settings={
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "lines",
-                    }
+        if resp.status_code != 200:
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = soup.find_all("div", class_="pricesSection_item")
+
+        if not items:
+            break
+
+        # Проверка на повторы страниц
+        first_title_el = (
+            items[0].find("div", class_="pricesSection_name") if items else None
+        )
+        first_title = first_title_el.get_text(strip=True) if first_title_el else ""
+        if first_title and first_title in seen_services:
+            break
+        seen_services.add(first_title)
+
+        new_count = 0
+        for item in items:
+            name_tag = item.find("div", class_="pricesSection_name")
+            name = name_tag.get_text(strip=True) if name_tag else "Без названия"
+
+            # Основная цена
+            price_tag = item.find("div", class_="pricesSection_value")
+            price = None
+            if price_tag:
+                digits = "".join(
+                    ch for ch in price_tag.get_text(strip=True) if ch.isdigit()
                 )
+                price = int(digits) if digits else None
 
-            if not table:
-                continue
+            # Цена по подписке
+            sub_tag = item.find("div", class_="pricesSection_wrap-subscride")
+            sub_price = None
+            if sub_tag:
+                sub_digits = "".join(
+                    ch for ch in sub_tag.get_text(strip=True) if ch.isdigit()
+                )
+                sub_price = int(sub_digits) if sub_digits else None
 
-            for row in table:
-                # Очищаем ячейки от переносов строк и пробелов
-                cleaned_row = [
-                    re.sub(r"\s+", " ", cell).strip() if cell else "" for cell in row
-                ]
+            direction_results.append(
+                {
+                    "Направление": direction_name,
+                    "ID направления": direction_id,
+                    "Услуга": name,
+                    "Цена (руб.)": price,
+                    "Цена по подписке (руб.)": sub_price,
+                }
+            )
+            new_count += 1
 
-                # Пропускаем пустые строки
-                if not any(cleaned_row):
-                    continue
+        print(f"  [{direction_name}] Стр. {page}: добавлено {new_count} позиций")
+        page += 1
+        time.sleep(0.4)
 
-                # Игнорируем повторяющиеся шапки таблиц
-                row_str = " ".join(cleaned_row).lower()
-                if (
-                    "наименование" in row_str
-                    and "цена" in row_str
-                    or "код" in row_str
-                    and "стоимость" in row_str
-                ):
-                    continue
-
-                # Если в строке заполнена только одна ячейка — обычно это название раздела/подраздела
-                non_empty = [c for c in cleaned_row if c]
-                if len(non_empty) == 1 and len(cleaned_row) > 1:
-                    current_category = non_empty[0]
-                    continue
-
-                # Предполагаем стандартную структуру из 3-4 колонок:
-                # [Код услуги, Наименование, Цена] или [Номер, Код, Наименование, Цена]
-                code = ""
-                name = ""
-                price_val = None
-
-                # Ищем цену в последней или предпоследней колонке
-                for cell in reversed(cleaned_row):
-                    # Проверяем, есть ли в ячейке число цены
-                    digits = re.sub(r"[^\d]", "", cell)
-                    if digits and (
-                        "руб" in cell.lower()
-                        or len(digits) >= 2
-                        and cell.replace(" ", "").isdigit()
-                    ):
-                        try:
-                            price_val = int(digits)
-                            break
-                        except ValueError:
-                            pass
-
-                if price_val is not None:
-                    # Извлекаем код и наименование
-                    if len(cleaned_row) >= 3:
-                        code = cleaned_row[0]
-                        name = cleaned_row[1]
-                    elif len(cleaned_row) == 2:
-                        name = cleaned_row[0]
-
-                    records.append(
-                        {
-                            "Раздел": current_category,
-                            "Код услуги": code,
-                            "Наименование услуги": name,
-                            "Цена (руб.)": price_val,
-                            "Страница": page_num,
-                        }
-                    )
-
-            if page_num % 10 == 0 or page_num == total_pages:
-                print(f"  Обработано страниц: {page_num}/{total_pages}...")
-
-    return records
+    return direction_results
 
 
 def main():
-    # 1. Скачиваем свежий файл, если его еще нет
-    if not PDF_FILE.exists():
-        download_pdf(PDF_URL, PDF_FILE)
-    else:
-        print(f"Используем ранее скачанный файл: {PDF_FILE}")
+    session = requests.Session()
 
-    # 2. Парсим
-    data = extract_data_from_pdf(PDF_FILE)
+    # 1. Автоматически собираем все направления из инпутов
+    directions = get_all_directions(session)
 
-    # 3. Сохраняем в Excel
-    if data:
-        df = pd.DataFrame(data)
-        # Удаляем дубликаты, если страница переносилась с повтором
-        df = df.drop_duplicates(
-            subset=["Код услуги", "Наименование услуги", "Цена (руб.)"]
-        )
+    if not directions:
+        print("Направления не найдены. Проверьте соединение.")
+        return
 
-        df.to_excel(EXCEL_FILE, index=False, engine="openpyxl")
-        print(f"\n🎉 Готово! Всего извлечено услуг: {len(df)}")
-        print(f"Файл сохранен: {EXCEL_FILE}")
-    else:
-        print("Не удалось извлечь данные. Проверьте разметку первой страницы PDF.")
+    all_data = []
+
+    # 2. Проходимся циклом по каждому направлению
+    for idx, d in enumerate(directions, 1):
+        print(f"\n[{idx}/{len(directions)}] Сбор: {d['name']} (ID: {d['id']})")
+        items = parse_direction(session, d["id"], d["name"])
+        all_data.extend(items)
+        print(f"Всего по направлению: {len(items)} услуг")
+
+    # 3. Сохраняем в итоговый Excel
+    if all_data:
+        data_dir = Path(__file__).resolve().parent.parent / "data"
+        data_dir.mkdir(exist_ok=True)
+        today = datetime.now().strftime("%Y-%m-%d")
+        file_path = data_dir / f"avaclinic_all_prices_{today}.xlsx"
+
+        df = pd.DataFrame(all_data)
+        df = df.drop_duplicates(subset=["ID направления", "Услуга", "Цена (руб.)"])
+        df.to_excel(file_path, index=False, engine="openpyxl")
+
+        print(f"\n🎉 Сбор завершен! Всего выгружено уникальных услуг: {len(df)}")
+        print(f"Файл сохранен: {file_path}")
 
 
 if __name__ == "__main__":
