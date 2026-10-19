@@ -14,23 +14,54 @@ HEADERS = {
 }
 
 
-def parse_target(
-    session: requests.Session, target_name: str, base_params: dict
+def get_all_directions(session: requests.Session) -> list[dict]:
+    """Сбор всех чекбоксов DIRECTION с их ID и названиями."""
+    print("Ищем все направления на странице цен...")
+    resp = session.get(BASE_URL, headers=HEADERS)
+
+    if resp.status_code != 200:
+        print(f"Ошибка загрузки главной страницы: {resp.status_code}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    directions = []
+
+    # Находим все чекбоксы с name="DIRECTION"
+    inputs = soup.find_all("input", {"name": "DIRECTION"})
+
+    for inp in inputs:
+        d_id = inp.get("value")
+        name = inp.get("data-name")
+
+        if not name:
+            label = soup.find("label", {"id": d_id})
+            name = label.get_text(strip=True) if label else f"Направление_{d_id}"
+
+        if d_id and d_id.isdigit():
+            directions.append({"id": d_id, "name": name.strip()})
+
+    print(f"Найдено направлений: {len(directions)}")
+    return directions
+
+
+def parse_direction(
+    session: requests.Session, direction_id: str, direction_name: str
 ) -> list[dict]:
-    """Универсальный сбор услуг для любого набора параметров (DIRECTION, CATEGORY и т.д.)."""
+    """Парсит все страницы услуг конкретного направления."""
     page = 1
-    target_results = []
+    direction_results = []
     seen_services = set()
 
     while True:
-        # Копируем базовые параметры фильтра
-        params = base_params.copy()
-
-        # Для страниц 2+ добавляем ajax-пагинацию Битрикса
-        if page > 1:
-            params["SERVICE_NAV"] = f"page-{page}"
-            params["ajax"] = "Y"
-            params["APPEND"] = "Y"
+        if page == 1:
+            params = {"DIRECTION": direction_id}
+        else:
+            params = {
+                "DIRECTION": direction_id,
+                "SERVICE_NAV": f"page-{page}",
+                "ajax": "Y",
+                "APPEND": "Y",
+            }
 
         try:
             resp = session.get(BASE_URL, params=params, headers=HEADERS, timeout=15)
@@ -39,17 +70,15 @@ def parse_target(
             break
 
         if resp.status_code != 200:
-            print(f"  Страница {page} вернула статус {resp.status_code}")
             break
 
         soup = BeautifulSoup(resp.text, "html.parser")
         items = soup.find_all("div", class_="pricesSection_item")
 
-        # Если услуг больше нет — пагинация закончилась
         if not items:
             break
 
-        # Защита от зацикливания, если сервер при превышении страниц отдает первую
+        # Проверка на повторы страниц
         first_title_el = (
             items[0].find("div", class_="pricesSection_name") if items else None
         )
@@ -81,10 +110,10 @@ def parse_target(
                 )
                 sub_price = int(sub_digits) if sub_digits else None
 
-            target_results.append(
+            direction_results.append(
                 {
-                    "Раздел / Направление": target_name,
-                    "Параметры фильтра": str(base_params),
+                    "Направление": direction_name,
+                    "ID направления": direction_id,
                     "Услуга": name,
                     "Цена (руб.)": price,
                     "Цена по подписке (руб.)": sub_price,
@@ -92,44 +121,45 @@ def parse_target(
             )
             new_count += 1
 
-        print(f"  [{target_name}] Стр. {page}: добавлено {new_count} позиций")
+        print(f"  [{direction_name}] Стр. {page}: добавлено {new_count} позиций")
         page += 1
         time.sleep(0.4)
 
-    return target_results
+    return direction_results
 
 
 def main():
     session = requests.Session()
 
-    # Список задач для сбора (можно передавать любые параметры из адресной строки сайта)
-    targets = [
-        {"name": "Акушерство и гинекология", "params": {"DIRECTION": "22"}},
-        {"name": "Направление 19", "params": {"DIRECTION": "19"}},
-        {"name": "Педиатрия", "params": {"DIRECTION": "38"}},
-    ]
+    # 1. Автоматически собираем все направления из инпутов
+    directions = get_all_directions(session)
+
+    if not directions:
+        print("Направления не найдены. Проверьте соединение.")
+        return
 
     all_data = []
 
-    for t in targets:
-        print(f"\nНачинаем сбор: {t['name']} с параметрами {t['params']}")
-        items = parse_target(session, t["name"], t["params"])
+    # 2. Проходимся циклом по каждому направлению
+    for idx, d in enumerate(directions, 1):
+        print(f"\n[{idx}/{len(directions)}] Сбор: {d['name']} (ID: {d['id']})")
+        items = parse_direction(session, d["id"], d["name"])
         all_data.extend(items)
-        print(f"Всего по {t['name']}: {len(items)} услуг")
+        print(f"Всего по направлению: {len(items)} услуг")
 
+    # 3. Сохраняем в итоговый Excel
     if all_data:
         data_dir = Path(__file__).resolve().parent.parent / "data"
         data_dir.mkdir(exist_ok=True)
         today = datetime.now().strftime("%Y-%m-%d")
-        file_path = data_dir / f"avaclinic_combined_{today}.xlsx"
+        file_path = data_dir / f"avaclinic_all_prices_{today}.xlsx"
 
         df = pd.DataFrame(all_data)
-        # Удаляем дубликаты, если услуга дублируется в разных категориях
-        df = df.drop_duplicates(
-            subset=["Раздел / Направление", "Услуга", "Цена (руб.)"]
-        )
+        df = df.drop_duplicates(subset=["ID направления", "Услуга", "Цена (руб.)"])
         df.to_excel(file_path, index=False, engine="openpyxl")
-        print(f"\nГотово! Выгружено {len(df)} уникальных строк в файл: {file_path}")
+
+        print(f"\n🎉 Сбор завершен! Всего выгружено уникальных услуг: {len(df)}")
+        print(f"Файл сохранен: {file_path}")
 
 
 if __name__ == "__main__":
