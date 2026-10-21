@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dota_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: dota_analytics
+      POSTGRES_USER: dota_user
+      POSTGRES_PASSWORD: dota_password
+    ports:
+      # Пробрасываем порт контейнера 5432 на порт хоста 5432
+      - "5432:5432"
+    volumes:
+      # Сохраняем данные на диск сервера, чтобы база не обнулялась при рестарте
+      - pg_data:/var/lib/postgresql/data
+      # Автоматическое выполнение вашего init.sql при первом запуске контейнера
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  pg_data:
